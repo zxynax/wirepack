@@ -10,6 +10,7 @@ import com.cdrware.wirepack.api.Wirepack;
 import com.cdrware.wirepack.api.WirepackConfig;
 import com.cdrware.wirepack.api.WirepackRuntime;
 import com.cdrware.wirepack.core.ReliableSession;
+import com.cdrware.wirepack.crypto.AeadSuite;
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -31,6 +32,41 @@ class CryptoUdpSmokeTest {
             key[i] = (byte) (i + 1);
         }
         runPing(key, key, true);
+    }
+
+    @Test
+    void aesPingWhenBothPrefer() throws Exception {
+        byte[] key = new byte[32];
+        for (int i = 0; i < key.length; i++) {
+            key[i] = (byte) (i + 3);
+        }
+        CountDownLatch got = new CountDownLatch(1);
+        AtomicReference<Entity> received = new AtomicReference<>();
+        AtomicReference<ReliableSession> server = new AtomicReference<>();
+        WirepackConfig listenCfg = cfg(key, SafetyLimits.defaults(), true);
+        WirepackConfig connectCfg = cfg(key, SafetyLimits.defaults(), true);
+        try (WirepackRuntime listenRt = Wirepack.open(listenCfg);
+             WirepackRuntime connectRt = Wirepack.open(connectCfg)) {
+            SessionAcceptor acceptor = listenRt.listen(new BindAddress("127.0.0.1", 0))
+                    .get(5, TimeUnit.SECONDS);
+            acceptor.onAccept(s -> {
+                server.set((ReliableSession) s);
+                s.onEntity(e -> {
+                    received.set(e);
+                    got.countDown();
+                });
+            });
+            ReliableSession client = (ReliableSession) connectRt
+                    .connect(new PeerAddress("127.0.0.1", acceptor.bindAddress().port()))
+                    .get(5, TimeUnit.SECONDS);
+            client.handshakeFuture().get(5, TimeUnit.SECONDS);
+            assertEquals(AeadSuite.AES_256_GCM, client.negotiatedAead());
+            client.send(List.of(new Entity(1024, "aes-ping".getBytes(StandardCharsets.UTF_8))))
+                    .get(5, TimeUnit.SECONDS);
+            assertTrue(got.await(5, TimeUnit.SECONDS));
+            assertEquals("aes-ping", new String(received.get().value(), StandardCharsets.UTF_8));
+            assertEquals(AeadSuite.AES_256_GCM, server.get().negotiatedAead());
+        }
     }
 
     @Test
@@ -126,9 +162,14 @@ class CryptoUdpSmokeTest {
     }
 
     private static WirepackConfig cfg(byte[] key, SafetyLimits limits) {
+        return cfg(key, limits, false);
+    }
+
+    private static WirepackConfig cfg(byte[] key, SafetyLimits limits, boolean preferAesGcm) {
         return WirepackConfig.builder()
                 .sharedKey(key)
                 .keyId(1)
+                .preferAesGcm(preferAesGcm)
                 .limits(limits)
                 .transport(new NettyUdpTransportFactory())
                 .build();

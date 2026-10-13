@@ -9,16 +9,21 @@ import com.cdrware.wirepack.api.SafetyLimits;
 import com.cdrware.wirepack.api.Session;
 import com.cdrware.wirepack.api.WirepackConfig;
 import com.cdrware.wirepack.api.WirepackException;
+import com.cdrware.wirepack.codec.EntityFragCodec;
 import com.cdrware.wirepack.codec.EntityReader;
 import com.cdrware.wirepack.codec.EntityWriter;
 import com.cdrware.wirepack.codec.FrameCodec;
-import com.cdrware.wirepack.crypto.ChaCha20Poly1305;
+import com.cdrware.wirepack.codec.KvTreeCodec;
+import com.cdrware.wirepack.codec.ObjectBinder;
+import com.cdrware.wirepack.crypto.AeadPayload;
+import com.cdrware.wirepack.crypto.AeadSuite;
 import com.cdrware.wirepack.crypto.SessionCrypto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -36,8 +41,8 @@ import java.util.function.Consumer;
  */
 public final class ReliableSession implements Session {
     private static final Logger log = LoggerFactory.getLogger(ReliableSession.class);
-    /** nonce(12) + tag(16) overhead for sealed payloads. */
-    private static final int AEAD_OVERHEAD = ChaCha20Poly1305.NONCE_LEN + ChaCha20Poly1305.TAG_LEN;
+    /** nonce(12) + tag(16). Same for ChaCha20-Poly1305 and AES-256-GCM. */
+    private static final int AEAD_OVERHEAD = AeadPayload.OVERHEAD;
     /** Idle time with unacked DATA before proactive retransmit (keepalive). */
     private static final long RETRANSMIT_TIMEOUT_MS = 100L;
     /** Max frames resent per keepalive tick. */
@@ -53,7 +58,10 @@ public final class ReliableSession implements Session {
     private final RetransmitBuffer retransmit;
     private final AtomicBoolean open = new AtomicBoolean(true);
     private final CopyOnWriteArrayList<Consumer<Entity>> entityHandlers = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<Consumer<Map<String, Object>>> treeHandlers = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<ObjectSubscription<?>> objectHandlers = new CopyOnWriteArrayList<>();
     private final CopyOnWriteArrayList<Runnable> closeHandlers = new CopyOnWriteArrayList<>();
+    private final EntityFragCodec.Reassembler fragReassembler = new EntityFragCodec.Reassembler();
     private final int streamId;
     private final SessionCrypto crypto;
     private final CompletableFuture<Void> handshake = new CompletableFuture<>();
@@ -78,7 +86,8 @@ public final class ReliableSession implements Session {
         this.retransmit = new RetransmitBuffer(config.limits());
         byte[] psk = config.sharedKeyRaw();
         if (psk != null && psk.length > 0) {
-            this.crypto = SessionCrypto.create(psk, config.keyId(), config.limits().rekeyAfterPackets());
+            this.crypto = SessionCrypto.create(
+                    psk, config.keyId(), config.limits().rekeyAfterPackets(), config.preferAesGcm());
         } else {
             this.crypto = null;
             handshake.complete(null);
@@ -91,6 +100,11 @@ public final class ReliableSession implements Session {
 
     public boolean cryptoEnabled() {
         return crypto != null;
+    }
+
+    /** Traffic suite locked at HELLO, or null before handshake / when crypto is off. */
+    public AeadSuite negotiatedAead() {
+        return crypto == null ? null : crypto.aeadSuite();
     }
 
     public CompletableFuture<Void> handshakeFuture() {
@@ -126,6 +140,36 @@ public final class ReliableSession implements Session {
         try {
             doSend(entities);
             return CompletableFuture.completedFuture(null);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Void> sendTree(Map<String, ?> root) {
+        if (!open.get()) {
+            return CompletableFuture.failedFuture(new WirepackException("session closed"));
+        }
+        if (crypto != null && !crypto.handshakeComplete()) {
+            return handshake.thenCompose(v -> sendTree(root));
+        }
+        try {
+            SafetyLimits limits = config.limits();
+            byte[] value = KvTreeCodec.encode(root, limits);
+            int aead = crypto != null ? AEAD_OVERHEAD : 0;
+            List<Entity> wire = EntityFragCodec.toWireEntities(
+                    BuiltinTypeId.KV_TREE.id(), value, limits, aead);
+            doSend(wire);
+            return CompletableFuture.completedFuture(null);
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    @Override
+    public <T> CompletableFuture<Void> sendObject(T bean) {
+        try {
+            return sendTree(ObjectBinder.toTree(bean));
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
         }
@@ -344,12 +388,43 @@ public final class ReliableSession implements Session {
                         log.warn("entity handler error", ex);
                     }
                 }
+                try {
+                    if (e.typeId() == BuiltinTypeId.KV_TREE.id()) {
+                        dispatchTreeEntity(e);
+                    } else if (e.typeId() == BuiltinTypeId.ENTITY_FRAG.id()) {
+                        fragReassembler.accept(e).ifPresent(logical -> {
+                            if (logical.typeId() == BuiltinTypeId.KV_TREE.id()) {
+                                dispatchTreeEntity(logical);
+                            }
+                        });
+                    }
+                } catch (Exception ex) {
+                    log.warn("tree reassembly/dispatch error", ex);
+                }
             }
         }
         sendControl(MsgType.ACK, state.buildAckPayload());
         byte[] req = state.buildReqPayload();
         if (req.length > 0) {
             sendControl(MsgType.REQ, req);
+        }
+    }
+
+    private void dispatchTreeEntity(Entity e) {
+        Map<String, Object> tree = KvTreeCodec.decodeEntity(e, config.limits());
+        for (Consumer<Map<String, Object>> c : treeHandlers) {
+            try {
+                c.accept(tree);
+            } catch (Exception ex) {
+                log.warn("tree handler error", ex);
+            }
+        }
+        for (ObjectSubscription<?> sub : objectHandlers) {
+            try {
+                sub.dispatch(tree);
+            } catch (Exception ex) {
+                log.warn("object handler error", ex);
+            }
         }
     }
 
@@ -437,8 +512,34 @@ public final class ReliableSession implements Session {
     }
 
     @Override
+    public void onTree(Consumer<Map<String, Object>> handler) {
+        treeHandlers.add(Objects.requireNonNull(handler));
+    }
+
+    @Override
+    public <T> void onObject(Class<T> type, Consumer<T> handler) {
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(handler, "handler");
+        objectHandlers.add(new ObjectSubscription<>(type, handler));
+    }
+
+    @Override
     public void onClose(Runnable handler) {
         closeHandlers.add(Objects.requireNonNull(handler));
+    }
+
+    private static final class ObjectSubscription<T> {
+        private final Class<T> type;
+        private final Consumer<T> handler;
+
+        ObjectSubscription(Class<T> type, Consumer<T> handler) {
+            this.type = type;
+            this.handler = handler;
+        }
+
+        void dispatch(Map<String, Object> tree) {
+            handler.accept(ObjectBinder.fromTree(tree, type));
+        }
     }
 
     @Override

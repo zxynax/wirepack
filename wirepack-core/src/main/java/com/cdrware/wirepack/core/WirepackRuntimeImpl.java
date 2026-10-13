@@ -73,6 +73,7 @@ public final class WirepackRuntimeImpl implements WirepackRuntime {
                     .transport(config.transportFactory())
                     .limits(config.limits())
                     .crypto(config.crypto())
+                    .preferAesGcm(config.preferAesGcm())
                     .windowSize(config.windowSize())
                     .build();
         } catch (ActivationException e) {

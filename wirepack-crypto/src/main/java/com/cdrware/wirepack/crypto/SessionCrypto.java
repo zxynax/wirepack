@@ -11,13 +11,14 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Wirepack v1 session crypto: PSK HELLO → X25519 traffic key → ChaCha20-Poly1305,
- * with in-flight REKEY_OFFER / REKEY_ACCEPT.
+ * Wirepack v1 session crypto: PSK HELLO (always ChaCha20-Poly1305) → X25519 traffic key,
+ * then the negotiated AEAD. AES-256-GCM is used only when both peers advertise it;
+ * otherwise ChaCha20-Poly1305. In-flight REKEY stays on the suite locked at handshake.
  */
 public final class SessionCrypto implements CryptoSpi {
     private static final String INFO_HELLO = "wirepack-v1-hello";
-    private static final String INFO_TRAFFIC = "wirepack-v1-traffic";
-    private static final String INFO_REKEY = "wirepack-v1-rekey";
+    /** HELLO plaintext: {@code x25519_public[32] || aeadFlags:u8}. */
+    static final int HELLO_PLAIN_LEN = X25519.KEY_LEN + 1;
     private static final int REKEY_VALUE_LEN = 4 + 4 + X25519.KEY_LEN;
 
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -27,8 +28,11 @@ public final class SessionCrypto implements CryptoSpi {
     private final byte[] helloKey;
     private final X25519.KeyPair ephemeral;
     private final int rekeyAfterPackets;
+    private final boolean preferAesGcm;
 
     private volatile byte[] peerPublic;
+    private volatile boolean peerOffersAesGcm;
+    private volatile AeadSuite aeadSuite;
     private final ConcurrentHashMap<Integer, byte[]> trafficKeys = new ConcurrentHashMap<>();
     private volatile int currentKeyId;
     private volatile boolean handshakeComplete;
@@ -38,7 +42,7 @@ public final class SessionCrypto implements CryptoSpi {
     private int pendingRekeyNextKeyId;
     private int pendingRekeyNonce;
 
-    private SessionCrypto(byte[] psk, int baseKeyId, int rekeyAfterPackets) {
+    private SessionCrypto(byte[] psk, int baseKeyId, int rekeyAfterPackets, boolean preferAesGcm) {
         Objects.requireNonNull(psk, "psk");
         if (psk.length == 0) {
             throw new IllegalArgumentException("psk must be non-empty");
@@ -49,13 +53,22 @@ public final class SessionCrypto implements CryptoSpi {
         this.psk = psk.clone();
         this.baseKeyId = baseKeyId;
         this.rekeyAfterPackets = rekeyAfterPackets;
+        this.preferAesGcm = preferAesGcm;
         this.helloKey = HkdfSha256.expand(this.psk, INFO_HELLO, 32);
         this.ephemeral = X25519.generateKeyPair();
         this.currentKeyId = baseKeyId;
     }
 
     public static SessionCrypto create(byte[] psk, int keyId, int rekeyAfterPackets) {
-        return new SessionCrypto(psk, keyId, rekeyAfterPackets);
+        return create(psk, keyId, rekeyAfterPackets, false);
+    }
+
+    /**
+     * @param preferAesGcm local willingness to use AES-256-GCM. The session uses it
+     *     only when the peer's HELLO sets the same flag.
+     */
+    public static SessionCrypto create(byte[] psk, int keyId, int rekeyAfterPackets, boolean preferAesGcm) {
+        return new SessionCrypto(psk, keyId, rekeyAfterPackets, preferAesGcm);
     }
 
     @Override
@@ -67,16 +80,31 @@ public final class SessionCrypto implements CryptoSpi {
         return ephemeral.publicKey();
     }
 
+    public boolean preferAesGcm() {
+        return preferAesGcm;
+    }
+
+    /** Negotiated traffic suite, or null until HELLO completes. */
+    public AeadSuite aeadSuite() {
+        return aeadSuite;
+    }
+
     public byte[] sealHello(byte[] aad) {
-        return AeadPayload.seal(helloKey, aad, ephemeral.publicKeyRaw());
+        byte[] plain = new byte[HELLO_PLAIN_LEN];
+        System.arraycopy(ephemeral.publicKeyRaw(), 0, plain, 0, X25519.KEY_LEN);
+        plain[X25519.KEY_LEN] = (byte) AeadSuite.helloFlags(preferAesGcm);
+        return AeadPayload.seal(helloKey, aad, plain);
     }
 
     public synchronized void acceptPeerHello(byte[] aad, byte[] sealedHello) {
-        byte[] peerPub = AeadPayload.open(helloKey, aad, sealedHello);
-        if (peerPub.length != X25519.KEY_LEN) {
-            throw new IllegalArgumentException("peer HELLO public key must be 32 bytes");
+        byte[] plain = AeadPayload.open(helloKey, aad, sealedHello);
+        if (plain.length != HELLO_PLAIN_LEN) {
+            throw new IllegalArgumentException(
+                    "peer HELLO must be " + HELLO_PLAIN_LEN + " bytes, got " + plain.length);
         }
+        byte[] peerPub = Arrays.copyOf(plain, X25519.KEY_LEN);
         this.peerPublic = peerPub;
+        this.peerOffersAesGcm = AeadSuite.offersAesGcm(plain[X25519.KEY_LEN] & 0xff);
         if (!handshakeComplete) {
             deriveTraffic();
         }
@@ -89,11 +117,13 @@ public final class SessionCrypto implements CryptoSpi {
         if (peerPublic == null) {
             throw new IllegalStateException("peer public key not set");
         }
+        AeadSuite suite = AeadSuite.negotiate(preferAesGcm, peerOffersAesGcm);
         byte[] ss = X25519.agree(ephemeral.privateKeyRaw(), peerPublic);
         byte[] localPub = ephemeral.publicKeyRaw();
-        byte[] traffic = hkdfFromEcdh(psk, ss, localPub, peerPublic, INFO_TRAFFIC);
+        byte[] traffic = hkdfFromEcdh(psk, ss, localPub, peerPublic, suite.trafficInfo());
         Arrays.fill(ss, (byte) 0);
 
+        this.aeadSuite = suite;
         int trafficKeyId = baseKeyId + 1;
         trafficKeys.put(trafficKeyId, traffic);
         currentKeyId = trafficKeyId;
@@ -115,7 +145,7 @@ public final class SessionCrypto implements CryptoSpi {
         if (key == null) {
             throw new IllegalStateException("no traffic key for keyId=" + currentKeyId);
         }
-        byte[] sealed = AeadPayload.seal(key, aad, plaintext);
+        byte[] sealed = AeadPayload.seal(aeadSuite, key, aad, plaintext);
         packetsSealedWithCurrent++;
         return sealed;
     }
@@ -125,7 +155,11 @@ public final class SessionCrypto implements CryptoSpi {
         if (key == null) {
             throw new IllegalStateException("unknown traffic keyId=" + keyId);
         }
-        return AeadPayload.open(key, aad, sealed);
+        AeadSuite suite = aeadSuite;
+        if (suite == null) {
+            throw new IllegalStateException("handshake not complete");
+        }
+        return AeadPayload.open(suite, key, aad, sealed);
     }
 
     public synchronized boolean shouldRekey() {
@@ -153,7 +187,7 @@ public final class SessionCrypto implements CryptoSpi {
         X25519.KeyPair local = X25519.generateKeyPair();
         byte[] current = requireCurrentTrafficKey();
         byte[] next = hkdfFromEcdh(current, X25519.agree(local.privateKeyRaw(), offer.publicKey()),
-                local.publicKeyRaw(), offer.publicKey(), INFO_REKEY);
+                local.publicKeyRaw(), offer.publicKey(), aeadSuite.rekeyInfo());
         installRekey(offer.nextKeyId(), next);
         rekeyInFlight = false;
         pendingRekey = null;
@@ -168,7 +202,7 @@ public final class SessionCrypto implements CryptoSpi {
             byte[] current = requireCurrentTrafficKey();
             byte[] next = hkdfFromEcdh(current,
                     X25519.agree(pendingRekey.privateKeyRaw(), offer.publicKey()),
-                    pendingRekey.publicKeyRaw(), offer.publicKey(), INFO_REKEY);
+                    pendingRekey.publicKeyRaw(), offer.publicKey(), aeadSuite.rekeyInfo());
             installRekey(Math.max(offer.nextKeyId(), pendingRekeyNextKeyId), next);
             pendingRekey = null;
             rekeyInFlight = false;
@@ -188,7 +222,7 @@ public final class SessionCrypto implements CryptoSpi {
         byte[] current = requireCurrentTrafficKey();
         byte[] next = hkdfFromEcdh(current,
                 X25519.agree(pendingRekey.privateKeyRaw(), accept.publicKey()),
-                pendingRekey.publicKeyRaw(), accept.publicKey(), INFO_REKEY);
+                pendingRekey.publicKeyRaw(), accept.publicKey(), aeadSuite.rekeyInfo());
         installRekey(accept.nextKeyId(), next);
         pendingRekey = null;
         rekeyInFlight = false;

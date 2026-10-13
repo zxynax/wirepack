@@ -13,7 +13,11 @@ public final class DefaultCryptoSpi implements CryptoSpi {
     }
 
     public static DefaultCryptoSpi create(byte[] psk, int keyId, int rekeyAfterPackets) {
-        return new DefaultCryptoSpi(SessionCrypto.create(psk, keyId, rekeyAfterPackets));
+        return create(psk, keyId, rekeyAfterPackets, false);
+    }
+
+    public static DefaultCryptoSpi create(byte[] psk, int keyId, int rekeyAfterPackets, boolean preferAesGcm) {
+        return new DefaultCryptoSpi(SessionCrypto.create(psk, keyId, rekeyAfterPackets, preferAesGcm));
     }
 
     public SessionCrypto session() {

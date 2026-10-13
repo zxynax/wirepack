@@ -9,7 +9,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the wire format and [PLAN.md](PLAN.md) for de
 | Artifact | Role |
 |----------|------|
 | `wirepack-api` | Public API, SPI (`ActivationProvider`, `CryptoSpi`, `TransportFactory`), limits |
-| `wirepack-crypto` | X25519, HKDF-SHA256, ChaCha20-Poly1305, SessionCrypto |
+| `wirepack-crypto` | X25519, HKDF-SHA256, ChaCha20-Poly1305, optional AES-256-GCM, SessionCrypto |
 | `wirepack-core` | Retransmit buffer, reliable session, `Wirepack.open` runtime |
 | `wirepack-netty` | Netty UDP transport (shared event loop) |
 | `wirepack-activate-http` | HTTPS activate-device client + tiny JDK HttpServer helper |
@@ -62,7 +62,18 @@ WirepackConfig config = WirepackConfig.builder()
 
 try (WirepackRuntime runtime = Wirepack.open(config)) {
     Session session = runtime.connect(new PeerAddress("127.0.0.1", 9700)).join();
-    session.onEntity(e -> { /* handle */ });
+
+    // Free-form trees (auto ENTITY_FRAG when large):
+    session.onTree(tree -> { /* Map/List graph */ });
+    session.sendTree(Map.of("object", Map.of("object", Map.of()))).join();
+
+    // POJO / record binder (Jackson-shaped use without Jackson):
+    record Order(String id, long qty) {}
+    session.onObject(Order.class, order -> { /* domain object */ });
+    session.sendObject(new Order("o1", 3)).join();
+
+    // Or typed registry rows / raw entities:
+    session.onEntity(e -> { /* Entity TLV */ });
     session.send(List.of(new Entity(1024, payload))).join();
 }
 ```
@@ -80,7 +91,10 @@ config = WirepackConfig.builder()
 
 `ActivationProvider` may be null when a shared key is already configured.
 
-**Crypto (v1):** When `sharedKey` / activation PSK is set, peers run a PSK-AEAD HELLO,
-immediately ECDH to a traffic key (PSK shed from seal path), then ChaCha20-Poly1305 on
-DATA. In-flight rekey after `SafetyLimits.rekeyAfterPackets` (default 10000). Omit the
-shared key for the cleartext/CRC profile. See [PROTOCOL.md](PROTOCOL.md).
+**Crypto (v1):** When `sharedKey` / activation PSK is set, peers run a PSK-AEAD HELLO
+(always ChaCha20-Poly1305), immediately ECDH to a traffic key (PSK shed from seal path),
+then seal DATA with the negotiated AEAD. Default is ChaCha20-Poly1305. Call
+`preferAesGcm(true)` on both peers to use AES-256-GCM; if only one side opts in, the
+session stays on ChaCha. In-flight rekey after `SafetyLimits.rekeyAfterPackets`
+(default 10000) keeps the suite chosen at HELLO. Omit the shared key for the
+cleartext/CRC profile. See [PROTOCOL.md](PROTOCOL.md).

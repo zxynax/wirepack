@@ -1,5 +1,7 @@
 package com.cdrware.wirepack.crypto;
 
+import com.cdrware.wirepack.api.Entity;
+
 import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
@@ -68,6 +70,8 @@ class CryptoTest {
 
         assertTrue(alice.handshakeComplete());
         assertTrue(bob.handshakeComplete());
+        assertEquals(AeadSuite.CHACHA20_POLY1305, alice.aeadSuite());
+        assertEquals(AeadSuite.CHACHA20_POLY1305, bob.aeadSuite());
         assertEquals(baseKeyId + 1, alice.currentKeyId());
         assertEquals(baseKeyId + 1, bob.currentKeyId());
 
@@ -92,5 +96,73 @@ class CryptoTest {
         byte[] sealed = alice.sealHello(aad);
         assertThrows(IllegalStateException.class, () -> bob.acceptPeerHello(aad, sealed));
         assertFalse(bob.handshakeComplete());
+    }
+
+    @Test
+    void aesOnlyWhenBothPrefer() {
+        byte[] psk = "shared-psk-material".getBytes(StandardCharsets.UTF_8);
+        byte[] aadA = "hello-aad-a".getBytes(StandardCharsets.UTF_8);
+        byte[] aadB = "hello-aad-b".getBytes(StandardCharsets.UTF_8);
+        byte[] trafficAad = "traffic-aad".getBytes(StandardCharsets.UTF_8);
+        byte[] msg = "app-payload".getBytes(StandardCharsets.UTF_8);
+
+        SessionCrypto alice = SessionCrypto.create(psk, 1, 100, true);
+        SessionCrypto bob = SessionCrypto.create(psk, 1, 100, true);
+        bob.acceptPeerHello(aadA, alice.sealHello(aadA));
+        alice.acceptPeerHello(aadB, bob.sealHello(aadB));
+        assertEquals(AeadSuite.AES_256_GCM, alice.aeadSuite());
+        assertEquals(AeadSuite.AES_256_GCM, bob.aeadSuite());
+        byte[] sealed = alice.sealTraffic(trafficAad, msg);
+        assertArrayEquals(msg, bob.openTraffic(alice.currentKeyId(), trafficAad, sealed));
+
+        SessionCrypto aes = SessionCrypto.create(psk, 1, 100, true);
+        SessionCrypto chacha = SessionCrypto.create(psk, 1, 100, false);
+        chacha.acceptPeerHello(aadA, aes.sealHello(aadA));
+        aes.acceptPeerHello(aadB, chacha.sealHello(aadB));
+        assertEquals(AeadSuite.CHACHA20_POLY1305, aes.aeadSuite());
+        assertEquals(AeadSuite.CHACHA20_POLY1305, chacha.aeadSuite());
+        byte[] mixed = aes.sealTraffic(trafficAad, msg);
+        assertArrayEquals(msg, chacha.openTraffic(aes.currentKeyId(), trafficAad, mixed));
+    }
+
+    @Test
+    void aesRekeyKeepsSuite() {
+        byte[] psk = "shared-psk-material".getBytes(StandardCharsets.UTF_8);
+        SessionCrypto alice = SessionCrypto.create(psk, 1, 1, true);
+        SessionCrypto bob = SessionCrypto.create(psk, 1, 1, true);
+        byte[] aad = "hello".getBytes(StandardCharsets.UTF_8);
+        bob.acceptPeerHello(aad, alice.sealHello(aad));
+        alice.acceptPeerHello(aad, bob.sealHello(aad));
+
+        Entity offer = alice.buildRekeyOffer();
+        Entity accept = bob.buildRekeyAccept(offer.valueRaw());
+        alice.onRekeyAccept(accept.valueRaw());
+
+        assertEquals(AeadSuite.AES_256_GCM, alice.aeadSuite());
+        assertEquals(alice.currentKeyId(), bob.currentKeyId());
+        byte[] trafficAad = "traffic-aad".getBytes(StandardCharsets.UTF_8);
+        byte[] msg = "after-rekey".getBytes(StandardCharsets.UTF_8);
+        byte[] sealed = alice.sealTraffic(trafficAad, msg);
+        assertArrayEquals(msg, bob.openTraffic(alice.currentKeyId(), trafficAad, sealed));
+    }
+
+    @Test
+    void aesAndChachaAreNotInterchangeable() {
+        byte[] key = HexFormat.of().parseHex(
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        byte[] aad = "header-aad".getBytes(StandardCharsets.UTF_8);
+        byte[] plain = "hello wirepack".getBytes(StandardCharsets.UTF_8);
+        byte[] sealed = AeadPayload.seal(AeadSuite.AES_256_GCM, key, aad, plain);
+        assertArrayEquals(plain, AeadPayload.open(AeadSuite.AES_256_GCM, key, aad, sealed));
+        assertThrows(IllegalStateException.class,
+                () -> AeadPayload.open(AeadSuite.CHACHA20_POLY1305, key, aad, sealed));
+    }
+
+    @Test
+    void negotiateRequiresBoth() {
+        assertEquals(AeadSuite.AES_256_GCM, AeadSuite.negotiate(true, true));
+        assertEquals(AeadSuite.CHACHA20_POLY1305, AeadSuite.negotiate(true, false));
+        assertEquals(AeadSuite.CHACHA20_POLY1305, AeadSuite.negotiate(false, true));
+        assertEquals(AeadSuite.CHACHA20_POLY1305, AeadSuite.negotiate(false, false));
     }
 }

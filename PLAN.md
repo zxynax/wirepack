@@ -154,18 +154,24 @@ ACK/REQ: no DATA seq consumption; bulk one-way uses standalone ACK + selective R
 
 ## Payload: K/V + parentId
 
-`(parentId, key, sizeBits, value)*` — JSON replacement + binary chunks. See prior plan sections (generality table unchanged in spirit).
+**Shipped as builtin `KV_TREE` (`type_id = 6`).** See [PROTOCOL.md](PROTOCOL.md) “KV_TREE value”.
+
+Wire shape: `(id, parentId, key, kind, value)*` under synthetic ancestor id `0`, with `parentId < id`, monotonic ids, iterative rebuild. Protocol entity ids are **not** application object fields.
+
+Primary DoS caps: `maxKvEntries` + `maxKvBytes`; `maxKvDepth` is an optional depth bound (default 64). Registry `NESTED` remains an opaque child-stream blob for fixed schemas — it does not replace `KV_TREE` for free-form maps.
+
+Legacy plan wording `sizeBits` is superseded by length-prefixed STRING/BYTES (and kind payloads) on the wire.
 
 ## Encryption
 
 - **v0 cleartext profile:** CRC + `CryptoSpi.noop()` when no shared key
 - **v1 (default when PSK present):**
   1. OOB **PSK** = authenticity root (activation / config) — not bulk traffic key
-  2. **HELLO** AEAD under `HKDF(PSK,"wirepack-v1-hello")` carries X25519 pubs
-  3. **Immediate** `HKDF(PSK||ECDH_ss||pubs) → traffic_key`; shed PSK from seal path
-  4. App DATA sealed with ChaCha20-Poly1305; payload = `nonce:12 || ct+tag`
-  5. **Rekey** at `rekeyAfterPackets` (default 10000) via piggybacked `REKEY_*` under current key
-  6. Algorithms: X25519, HKDF-SHA256, ChaCha20-Poly1305
+  2. **HELLO** AEAD under `HKDF(PSK,"wirepack-v1-hello")` carries X25519 pub + AEAD flag (always ChaCha)
+  3. **Immediate** `HKDF(PSK||ECDH_ss||pubs, info=traffic-<suite>) → traffic_key`; shed PSK from seal path
+  4. App DATA sealed with negotiated AEAD (ChaCha20-Poly1305, or AES-256-GCM only if both peers set `preferAesGcm`); payload = `nonce:12 || ct+tag`
+  5. **Rekey** at `rekeyAfterPackets` (default 10000) via piggybacked `REKEY_*` under current key; suite stays locked
+  6. Algorithms: X25519, HKDF-SHA256, ChaCha20-Poly1305, optional AES-256-GCM
 
 See [PROTOCOL.md](PROTOCOL.md) Crypto.
 
@@ -180,8 +186,8 @@ All parsing and buffers are **length-prefixed with hard caps** — Java avoids c
 | Control | Rule |
 |---------|------|
 | Max UDP/TCP frame | reject if `payloadLen` or total size &gt; `maxFrameBytes` (e.g. 1200–8192 configurable) **before** allocating |
-| Max K/V entries / depth | reject oversized trees |
-| Max `sizeBits` | reject &gt; 65535; reject values that exceed remaining frame |
+| Max K/V entries / bytes / depth | `maxKvEntries`, `maxKvBytes`, optional `maxKvDepth`; reject oversized trees |
+| Max string/bytes field | reject &gt; `maxStringBytes`; reject values that exceed remaining frame |
 | Retransmit buffer | max bytes + max entries per session; fail send on overflow |
 | Sessions | max concurrent sessions; idle timeout |
 | Rates | optional token bucket on accepts / activates |

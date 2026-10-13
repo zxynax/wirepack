@@ -6,7 +6,8 @@ import com.cdrware.wirepack.api.SafetyLimits;
  * Payload seal/open. Default noop = cleartext profile.
  *
  * <p>v1 default implementation (wirepack-crypto): PSK-authenticated HELLO, immediate
- * ECDH traffic key, ChaCha20-Poly1305; rekey after {@link SafetyLimits#rekeyAfterPackets()}.
+ * ECDH traffic key, ChaCha20-Poly1305 unless both peers offer AES-256-GCM;
+ * rekey after {@link SafetyLimits#rekeyAfterPackets()}.
  */
 public interface CryptoSpi {
     /**

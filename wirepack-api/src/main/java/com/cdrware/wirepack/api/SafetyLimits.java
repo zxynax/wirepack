@@ -8,6 +8,8 @@ public record SafetyLimits(
         int maxPayloadBytes,
         int maxKvDepth,
         int maxNestedDepth,
+        int maxKvEntries,
+        int maxKvBytes,
         int maxEntitiesPerFrame,
         int maxFieldsPerRegister,
         int maxStringBytes,
@@ -21,8 +23,12 @@ public record SafetyLimits(
     public static final int DEFAULT_MAX_FRAME_BYTES = 1400;
     /** maxFrame − header(20) − crc(4) */
     public static final int DEFAULT_MAX_PAYLOAD_BYTES = 1376;
-    public static final int DEFAULT_MAX_KV_DEPTH = 8;
+    /** Optional KV_TREE nesting depth (entries/bytes are primary DoS caps). */
+    public static final int DEFAULT_MAX_KV_DEPTH = 64;
+    /** Reserved for registry {@link WireType#NESTED} blob policy. */
     public static final int DEFAULT_MAX_NESTED_DEPTH = 8;
+    public static final int DEFAULT_MAX_KV_ENTRIES = 4096;
+    public static final int DEFAULT_MAX_KV_BYTES = 262_144;
     public static final int DEFAULT_MAX_ENTITIES_PER_FRAME = 256;
     public static final int DEFAULT_MAX_FIELDS_PER_REGISTER = 64;
     public static final int DEFAULT_MAX_STRING_BYTES = 65535;
@@ -43,6 +49,15 @@ public record SafetyLimits(
         if (maxPayloadBytes < 0 || maxPayloadBytes > maxFrameBytes) {
             throw new IllegalArgumentException("maxPayloadBytes out of range");
         }
+        if (maxKvEntries < 1) {
+            throw new IllegalArgumentException("maxKvEntries must be >= 1");
+        }
+        if (maxKvBytes < 1) {
+            throw new IllegalArgumentException("maxKvBytes must be >= 1");
+        }
+        if (maxKvDepth < 1) {
+            throw new IllegalArgumentException("maxKvDepth must be >= 1");
+        }
         if (rekeyAfterPackets < 1) {
             throw new IllegalArgumentException("rekeyAfterPackets must be >= 1");
         }
@@ -54,6 +69,8 @@ public record SafetyLimits(
                 DEFAULT_MAX_PAYLOAD_BYTES,
                 DEFAULT_MAX_KV_DEPTH,
                 DEFAULT_MAX_NESTED_DEPTH,
+                DEFAULT_MAX_KV_ENTRIES,
+                DEFAULT_MAX_KV_BYTES,
                 DEFAULT_MAX_ENTITIES_PER_FRAME,
                 DEFAULT_MAX_FIELDS_PER_REGISTER,
                 DEFAULT_MAX_STRING_BYTES,
@@ -79,6 +96,8 @@ public record SafetyLimits(
         private int maxPayloadBytes;
         private int maxKvDepth;
         private int maxNestedDepth;
+        private int maxKvEntries;
+        private int maxKvBytes;
         private int maxEntitiesPerFrame;
         private int maxFieldsPerRegister;
         private int maxStringBytes;
@@ -94,6 +113,8 @@ public record SafetyLimits(
             this.maxPayloadBytes = base.maxPayloadBytes;
             this.maxKvDepth = base.maxKvDepth;
             this.maxNestedDepth = base.maxNestedDepth;
+            this.maxKvEntries = base.maxKvEntries;
+            this.maxKvBytes = base.maxKvBytes;
             this.maxEntitiesPerFrame = base.maxEntitiesPerFrame;
             this.maxFieldsPerRegister = base.maxFieldsPerRegister;
             this.maxStringBytes = base.maxStringBytes;
@@ -109,6 +130,8 @@ public record SafetyLimits(
         public Builder maxPayloadBytes(int v) { this.maxPayloadBytes = v; return this; }
         public Builder maxKvDepth(int v) { this.maxKvDepth = v; return this; }
         public Builder maxNestedDepth(int v) { this.maxNestedDepth = v; return this; }
+        public Builder maxKvEntries(int v) { this.maxKvEntries = v; return this; }
+        public Builder maxKvBytes(int v) { this.maxKvBytes = v; return this; }
         public Builder maxEntitiesPerFrame(int v) { this.maxEntitiesPerFrame = v; return this; }
         public Builder maxFieldsPerRegister(int v) { this.maxFieldsPerRegister = v; return this; }
         public Builder maxStringBytes(int v) { this.maxStringBytes = v; return this; }
@@ -122,6 +145,7 @@ public record SafetyLimits(
         public SafetyLimits build() {
             return new SafetyLimits(
                     maxFrameBytes, maxPayloadBytes, maxKvDepth, maxNestedDepth,
+                    maxKvEntries, maxKvBytes,
                     maxEntitiesPerFrame, maxFieldsPerRegister, maxStringBytes,
                     maxRetransmitEntries, maxRetransmitBytes, maxSessions,
                     sessionIdleMs, maxActivateBodyBytes, rekeyAfterPackets

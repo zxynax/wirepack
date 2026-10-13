@@ -13,10 +13,13 @@ import java.util.Objects;
  *
  * <p>Non-empty {@link #sharedKey()} enables v1 PSK→HELLO→ECDH AEAD
  * ({@code rekeyAfterPackets} on {@link SafetyLimits}). Omit shared key for cleartext.
+ * Traffic AEAD is ChaCha20-Poly1305 unless {@link Builder#preferAesGcm(boolean)} is set
+ * on <em>both</em> peers, in which case the session uses AES-256-GCM.
  */
 public final class WirepackConfig {
     private final byte[] sharedKey;
     private final int keyId;
+    private final boolean preferAesGcm;
     private final ActivationProvider activationProvider;
     private final ActivationRequest activationRequest;
     private final ActivationResult activationResult;
@@ -28,6 +31,7 @@ public final class WirepackConfig {
     private WirepackConfig(Builder b) {
         this.sharedKey = b.sharedKey == null ? null : b.sharedKey.clone();
         this.keyId = b.keyId;
+        this.preferAesGcm = b.preferAesGcm;
         this.activationProvider = b.activationProvider;
         this.activationRequest = b.activationRequest;
         this.activationResult = b.activationResult;
@@ -47,6 +51,14 @@ public final class WirepackConfig {
 
     public int keyId() {
         return keyId;
+    }
+
+    /**
+     * Local willingness to use AES-256-GCM for traffic. The session uses AES only when
+     * the peer advertises the same preference in HELLO; otherwise ChaCha20-Poly1305.
+     */
+    public boolean preferAesGcm() {
+        return preferAesGcm;
     }
 
     public ActivationProvider activationProvider() {
@@ -84,6 +96,7 @@ public final class WirepackConfig {
     public static final class Builder {
         private byte[] sharedKey;
         private int keyId;
+        private boolean preferAesGcm;
         private ActivationProvider activationProvider;
         private ActivationRequest activationRequest;
         private ActivationResult activationResult;
@@ -99,6 +112,15 @@ public final class WirepackConfig {
 
         public Builder keyId(int keyId) {
             this.keyId = keyId;
+            return this;
+        }
+
+        /**
+         * Offer AES-256-GCM. Traffic uses it only when the peer also sets this;
+         * a single peer opting in keeps ChaCha20-Poly1305.
+         */
+        public Builder preferAesGcm(boolean preferAesGcm) {
+            this.preferAesGcm = preferAesGcm;
             return this;
         }
 
