@@ -15,6 +15,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the wire format and [PLAN.md](PLAN.md) for de
 | `wirepack-activate-http` | HTTPS activate-device client + tiny JDK HttpServer helper |
 | `wirepack-harness` | Runnable peer (`listen` / `connect`) |
 | `wirepack-bench` | **Optional** wirepack vs REST throughput harness (crypto, loss, multi-session; not required to use wirepack) |
+| `wirepack-spring` | **Optional** Spring Boot 4 auto-config: Netty UDP RPC beside Tomcat HTTP |
 
 GroupId: `com.cdrware.wirepack` · Version: `0.1.0-SNAPSHOT`
 
@@ -72,11 +73,56 @@ try (WirepackRuntime runtime = Wirepack.open(config)) {
     session.onObject(Order.class, order -> { /* domain object */ });
     session.sendObject(new Order("o1", 3)).join();
 
+    // RPC (route + corrId envelope over KV_TREE):
+    record EchoIn(String msg) {}
+    record EchoOut(String msg) {}
+    session.onRpc("echo", payload -> Map.of("msg", payload.get("msg")));
+    EchoOut out = session.request("echo", new EchoIn("hi"), EchoOut.class).join();
+
     // Or typed registry rows / raw entities:
     session.onEntity(e -> { /* Entity TLV */ });
     session.send(List.of(new Entity(1024, payload))).join();
 }
 ```
+
+### Spring Boot + Tomcat (optional)
+
+Tomcat stays on HTTP. Wirepack binds a **second** listener (Netty UDP) in the same JVM and calls the same handler methods. Add `wirepack-spring` (Spring Boot **4.1.2**) and opt in:
+
+```xml
+<dependency>
+  <groupId>com.cdrware.wirepack</groupId>
+  <artifactId>wirepack-spring</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+```properties
+wirepack.enabled=true
+wirepack.bind-host=0.0.0.0
+wirepack.bind-port=9700
+wirepack.key-id=1
+# Prefer env / secrets file — do not commit live keys
+wirepack.shared-key-hex=${WIREPACK_SHARED_KEY_HEX:}
+```
+
+Mark existing MVC methods (POJO in / POJO out — no `HttpServletRequest` / `MultipartFile` on the UDP path):
+
+```java
+@RestController
+public class OrderController {
+  @PostMapping("/orders")
+  @WirepackMapping("order.create")
+  public OrderResponse create(@RequestBody OrderRequest req) {
+    return orderService.create(req);
+  }
+}
+```
+
+- HTTP: `POST /orders` JSON → Tomcat / Spring MVC  
+- UDP: `session.request("order.create", req, OrderResponse.class)` → Netty wirepack  
+
+`@WirepackController` is optional. HTTP cookies/JWT and wirepack session crypto stay separate; map identity in the service layer. Core wirepack does not require Spring.
 
 Optional activation:
 

@@ -5,6 +5,10 @@ import com.cdrware.wirepack.api.Entity;
 import com.cdrware.wirepack.api.FrameHeader;
 import com.cdrware.wirepack.api.MsgType;
 import com.cdrware.wirepack.api.PeerAddress;
+import com.cdrware.wirepack.api.RpcEnvelope;
+import com.cdrware.wirepack.api.RpcError;
+import com.cdrware.wirepack.api.RpcException;
+import com.cdrware.wirepack.api.RpcHandler;
 import com.cdrware.wirepack.api.SafetyLimits;
 import com.cdrware.wirepack.api.Session;
 import com.cdrware.wirepack.api.WirepackConfig;
@@ -15,19 +19,24 @@ import com.cdrware.wirepack.codec.EntityWriter;
 import com.cdrware.wirepack.codec.FrameCodec;
 import com.cdrware.wirepack.codec.KvTreeCodec;
 import com.cdrware.wirepack.codec.ObjectBinder;
+import com.cdrware.wirepack.codec.RpcEnvelopeCodec;
 import com.cdrware.wirepack.crypto.AeadPayload;
 import com.cdrware.wirepack.crypto.AeadSuite;
 import com.cdrware.wirepack.crypto.SessionCrypto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -67,6 +76,9 @@ public final class ReliableSession implements Session {
     private final CompletableFuture<Void> handshake = new CompletableFuture<>();
     private final AtomicBoolean helloSent = new AtomicBoolean(false);
     private final Object sendCredit = new Object();
+    private final ConcurrentHashMap<Long, PendingRpc<?>> rpcPending = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RpcHandler> rpcRoutes = new ConcurrentHashMap<>();
+    private final AtomicLong rpcCorr = new AtomicLong();
 
     private volatile BiConsumer<PeerAddress, byte[]> sender;
     private volatile long lastAckProgressMs = System.currentTimeMillis();
@@ -412,6 +424,9 @@ public final class ReliableSession implements Session {
 
     private void dispatchTreeEntity(Entity e) {
         Map<String, Object> tree = KvTreeCodec.decodeEntity(e, config.limits());
+        if (handleRpcTree(tree)) {
+            return;
+        }
         for (Consumer<Map<String, Object>> c : treeHandlers) {
             try {
                 c.accept(tree);
@@ -426,6 +441,59 @@ public final class ReliableSession implements Session {
                 log.warn("object handler error", ex);
             }
         }
+    }
+
+    private boolean handleRpcTree(Map<String, Object> tree) {
+        if (!RpcEnvelopeCodec.isRpc(tree)) {
+            return false;
+        }
+        RpcEnvelope env;
+        try {
+            env = RpcEnvelopeCodec.decode(tree);
+        } catch (Exception ex) {
+            log.warn("rpc envelope decode failed", ex);
+            return true;
+        }
+        if (env.isResponse()) {
+            PendingRpc<?> pending = rpcPending.remove(env.corrId());
+            if (pending != null) {
+                pending.complete(env);
+            }
+            return true;
+        }
+        if (env.isRequest()) {
+            RpcHandler handler = rpcRoutes.get(env.route());
+            Map<String, Object> resPayload = null;
+            RpcError err = null;
+            if (handler == null) {
+                err = new RpcError(RpcError.NOT_FOUND, "no handler for route: " + env.route());
+            } else {
+                try {
+                    Map<String, Object> in = env.payload() == null ? Map.of() : env.payload();
+                    Object result = WirepackMappings.toPayload(handler.handle(in));
+                    if (result instanceof Map<?, ?>) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> asMap = (Map<String, Object>) result;
+                        resPayload = asMap;
+                    } else if (result != null) {
+                        resPayload = ObjectBinder.toTree(result);
+                    } else {
+                        resPayload = Map.of();
+                    }
+                } catch (Exception ex) {
+                    Throwable t = ex;
+                    if (t instanceof java.lang.reflect.InvocationTargetException ite && ite.getCause() != null) {
+                        t = ite.getCause();
+                    }
+                    String msg = t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
+                    err = new RpcError(RpcError.HANDLER, msg);
+                }
+            }
+            sendTree(RpcEnvelopeCodec.encode(
+                    RpcEnvelope.response(env.route(), env.corrId(), resPayload, err)));
+            return true;
+        }
+        return true;
     }
 
     private byte[] openIfNeeded(FrameHeader h, byte[] wirePayload) {
@@ -524,8 +592,77 @@ public final class ReliableSession implements Session {
     }
 
     @Override
+    public void onRpc(String route, RpcHandler handler) {
+        if (route == null || route.isBlank()) {
+            throw new WirepackException("rpc route is blank");
+        }
+        Objects.requireNonNull(handler, "handler");
+        RpcHandler prev = rpcRoutes.putIfAbsent(route, handler);
+        if (prev != null) {
+            throw new WirepackException("duplicate rpc route: " + route);
+        }
+    }
+
+    @Override
+    public <T> CompletableFuture<T> request(String route, Object body, Class<T> responseType, Duration timeout) {
+        Objects.requireNonNull(route, "route");
+        Objects.requireNonNull(responseType, "responseType");
+        if (!open.get()) {
+            return CompletableFuture.failedFuture(new WirepackException("session closed"));
+        }
+        Duration wait = timeout == null ? Duration.ofSeconds(30) : timeout;
+        long id = rpcCorr.incrementAndGet();
+        CompletableFuture<T> fut = new CompletableFuture<>();
+        PendingRpc<T> pending = new PendingRpc<>(fut, responseType);
+        rpcPending.put(id, pending);
+        Map<String, Object> payload;
+        try {
+            payload = body == null ? Map.of() : ObjectBinder.toTree(body);
+        } catch (Exception e) {
+            rpcPending.remove(id);
+            return CompletableFuture.failedFuture(e);
+        }
+        sendTree(RpcEnvelopeCodec.encode(RpcEnvelope.request(route, id, payload)))
+                .whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        rpcPending.remove(id);
+                        fut.completeExceptionally(ex);
+                    }
+                });
+        return fut.orTimeout(wait.toMillis(), TimeUnit.MILLISECONDS)
+                .whenComplete((r, ex) -> rpcPending.remove(id));
+    }
+
+    @Override
     public void onClose(Runnable handler) {
         closeHandlers.add(Objects.requireNonNull(handler));
+    }
+
+    private static final class PendingRpc<T> {
+        private final CompletableFuture<T> future;
+        private final Class<T> responseType;
+
+        PendingRpc(CompletableFuture<T> future, Class<T> responseType) {
+            this.future = future;
+            this.responseType = responseType;
+        }
+
+        void complete(RpcEnvelope env) {
+            if (env.error() != null) {
+                future.completeExceptionally(new RpcException(env.error()));
+                return;
+            }
+            try {
+                Map<String, Object> payload = env.payload() == null ? Map.of() : env.payload();
+                if (responseType == Void.class || responseType == void.class) {
+                    future.complete(null);
+                    return;
+                }
+                future.complete(ObjectBinder.fromTree(payload, responseType));
+            } catch (Exception e) {
+                future.completeExceptionally(new RpcException(RpcError.BIND, e.getMessage()));
+            }
+        }
     }
 
     private static final class ObjectSubscription<T> {
@@ -555,6 +692,10 @@ public final class ReliableSession implements Session {
         synchronized (sendCredit) {
             sendCredit.notifyAll();
         }
+        for (PendingRpc<?> p : rpcPending.values()) {
+            p.future.completeExceptionally(new WirepackException("session closed"));
+        }
+        rpcPending.clear();
         try {
             sendControl(MsgType.BYE, new byte[0]);
         } catch (Exception e) {

@@ -179,6 +179,23 @@ repeated entry_count times:
 - Caps (see SafetyLimits): **`maxKvEntries`**, **`maxKvBytes`** (primary DoS bounds); **`maxKvDepth`** optional depth bound. Wide flat trees are limited by entries/bytes, not depth alone.
 - Large trees that exceed one datagram use `ENTITY_FRAG` around the `KV_TREE` entity value (same as other large logical objects).
 
+### RPC envelope (KV_TREE convention)
+
+Request/response for controller-style handlers is a **logical** `KV_TREE`, not a new `type_id`. Marker `_wp = "rpc"` keeps these trees out of `onTree` / `onObject`. Large payloads still fragment via `ENTITY_FRAG`.
+
+Reserved keys:
+
+| Key | Kind | Notes |
+|-----|------|--------|
+| `_wp` | STRING | always `"rpc"` |
+| `kind` | STRING | `"req"` or `"res"` |
+| `route` | STRING | handler name, e.g. `order.create` |
+| `corrId` | I64 | correlation; unique per session sender |
+| `payload` | OBJECT or NULL | application POJO tree |
+| `error` | OBJECT or NULL | `{ code: STRING, message: STRING }` — set on failed `res` |
+
+Client: `Session.request(route, pojo, Response.class)` fills `corrId` and completes when a matching `res` arrives (or times out). Server: `Session.onRpc(route, handler)` / `@WirepackMapping`. Standard error codes: `NOT_FOUND`, `HANDLER`, `BIND`.
+
 ### ENTITY_FRAG value
 
 ```text

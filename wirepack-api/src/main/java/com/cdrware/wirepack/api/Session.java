@@ -1,5 +1,6 @@
 package com.cdrware.wirepack.api;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -45,6 +46,25 @@ public interface Session extends AutoCloseable {
      * Decode each complete tree into {@code type} and invoke {@code handler}.
      */
     <T> void onObject(Class<T> type, Consumer<T> handler);
+
+    /**
+     * Register a server handler for RPC {@code route}. Incoming request envelopes are
+     * not delivered to {@link #onTree}/{@link #onObject}.
+     */
+    void onRpc(String route, RpcHandler handler);
+
+    /**
+     * Send an RPC request and complete with the response payload bound to {@code responseType}.
+     * Default timeout is 30 seconds.
+     */
+    default <T> CompletableFuture<T> request(String route, Object body, Class<T> responseType) {
+        return request(route, body, responseType, Duration.ofSeconds(30));
+    }
+
+    /**
+     * Send an RPC request (route + POJO payload) and complete with the peer response.
+     */
+    <T> CompletableFuture<T> request(String route, Object body, Class<T> responseType, Duration timeout);
 
     void onClose(Runnable handler);
 
