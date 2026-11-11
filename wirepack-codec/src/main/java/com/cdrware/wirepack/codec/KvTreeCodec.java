@@ -142,6 +142,9 @@ public final class KvTreeCodec {
                     arr.add(attached);
                     continue;
                 }
+                if (idx < 0 || idx >= limits.maxKvEntries()) {
+                    throw new WirepackException("array index out of range: " + idx);
+                }
                 while (arr.size() <= idx) {
                     arr.add(null);
                 }
@@ -327,7 +330,12 @@ public final class KvTreeCodec {
         byte[] keyBytes = new byte[keyLen];
         buf.get(keyBytes);
         String key = new String(keyBytes, StandardCharsets.UTF_8);
-        KvValueKind kind = KvValueKind.fromCode(Byte.toUnsignedInt(buf.get()));
+        KvValueKind kind;
+        try {
+            kind = KvValueKind.fromCode(Byte.toUnsignedInt(buf.get()));
+        } catch (IllegalArgumentException ex) {
+            throw new WirepackException("unknown KV kind", ex);
+        }
         Object leaf = readLeaf(buf, kind, limits);
         return WireEntry.leaf(id, parentId, key, kind, leaf);
     }

@@ -13,7 +13,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the wire format and [PLAN.md](PLAN.md) for de
 | `wirepack-core` | Retransmit buffer, reliable session, `Wirepack.open` runtime |
 | `wirepack-netty` | Netty UDP transport (shared event loop) |
 | `wirepack-activate-http` | HTTPS activate-device client + tiny JDK HttpServer helper |
-| `wirepack-harness` | Runnable peer (`listen` / `connect`) |
+| `wirepack-harness` | Runnable peer (`listen` / `connect` / `activate-then-connect`) |
 | `wirepack-bench` | **Optional** wirepack vs REST throughput harness (crypto, loss, multi-session; not required to use wirepack) |
 | `wirepack-spring` | **Optional** Spring Boot 4 auto-config: Netty UDP RPC beside Tomcat HTTP |
 
@@ -27,6 +27,8 @@ mvn -q test
 mvn -q -pl wirepack-harness -am package
 ```
 
+`mvn test` runs `FrameDecoderFuzzTest` for 20 seconds with the rest of the suite (`JAZZER_FUZZ` is set on the codec module). A crash, or an allocation that gets past `SafetyLimits`, fails the build. The CI job is that same command.
+
 Throughput comparison (separate module — see [wirepack-bench/README.md](wirepack-bench/README.md)):
 
 ```bash
@@ -37,15 +39,28 @@ java -jar wirepack-bench/target/wirepack-bench-0.1.0-SNAPSHOT.jar --scenario all
 
 ## Run harness
 
-```bash
-# Terminal A — listen
-java -jar wirepack-harness/target/wirepack-harness-0.1.0-SNAPSHOT.jar \
-  --mode listen --bind 0.0.0.0:9700 --key 00112233445566778899aabbccddeeff
+The harness is the reference shape for running the library as a standalone service. [`wirepack-harness/harness.yaml`](wirepack-harness/harness.yaml) is a flat `key: value` file (comments allowed). Flags replace the same key. Ctrl-C closes the session, the optional health port, and a local activation bootstrap.
 
-# Terminal B — connect
+```bash
+# Terminal A — listen, and hand the same key out on a local HTTP bootstrap
+java -jar wirepack-harness/target/wirepack-harness-0.1.0-SNAPSHOT.jar \
+  --mode listen --bind 0.0.0.0:9700 \
+  --key 00112233445566778899aabbccddeeff --key-id 1 \
+  --activation-server 8080 --health 127.0.0.1:8081
+
+# Terminal B — activate, then open the data-plane session
+java -jar wirepack-harness/target/wirepack-harness-0.1.0-SNAPSHOT.jar \
+  --config wirepack-harness/harness.yaml \
+  --activate-url http://127.0.0.1:8080/activate
+
+# Same jar, shared key, no activation
 java -jar wirepack-harness/target/wirepack-harness-0.1.0-SNAPSHOT.jar \
   --mode connect --peer 127.0.0.1:9700 --key 00112233445566778899aabbccddeeff
 ```
+
+`activate-then-connect` POSTs the device id to `activateUrl`, then connects with the returned key. It uses the first returned endpoint unless `--peer` is set. Point `activateUrl` at the organization HTTPS endpoint in production. `--activation-server` is the local cleartext bootstrap, not that HTTPS server.
+
+`--health host:port` serves `GET /health` (process up) and `GET /ready` (listener bound, or the activated session connected). It is a local JDK HTTP port, not the UDP data plane.
 
 ## Embed
 
@@ -119,8 +134,11 @@ public class OrderController {
 }
 ```
 
-- HTTP: `POST /orders` JSON → Tomcat / Spring MVC  
-- UDP: `session.request("order.create", req, OrderResponse.class)` → Netty wirepack  
+- HTTP JSON: `POST /orders` with `Content-Type: application/json` → Tomcat / Spring MVC
+- HTTP wirepack: the same URL with `Content-Type: application/wirepack` and `Accept: application/wirepack`. The body is the `KV_TREE` of the handler POJO (the RPC payload tree, not the envelope and not a frame). `wirepack-spring` registers that converter whenever Spring MVC is on the classpath. It does not open the UDP port.
+- UDP RPC: `session.request("order.create", req, OrderResponse.class)` → Netty wirepack. The same POJO is wrapped in the RPC envelope (`route`, `corrId`) on a reliable session.
+
+Use HTTP wirepack when the caller is already on the servlet stack and wants the binary tree instead of JSON. Use UDP RPC for the data plane: loss recovery, session crypto, and a route name instead of a URL. JSON stays for existing HTTP clients. One `@PostMapping` + `@WirepackMapping` method serves all three when the argument and return value are POJOs.
 
 `@WirepackController` is optional. HTTP cookies/JWT and wirepack session crypto stay separate; map identity in the service layer. Core wirepack does not require Spring.
 

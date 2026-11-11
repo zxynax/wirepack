@@ -9,7 +9,10 @@ import com.cdrware.wirepack.api.Wirepack;
 import com.cdrware.wirepack.api.WirepackConfig;
 import com.cdrware.wirepack.api.WirepackMapping;
 import com.cdrware.wirepack.api.WirepackRuntime;
+import com.cdrware.wirepack.codec.KvTreeCodec;
+import com.cdrware.wirepack.codec.ObjectBinder;
 import com.cdrware.wirepack.netty.NettyUdpTransportFactory;
+import com.cdrware.wirepack.spring.WirepackHttpMessageConverter;
 import com.cdrware.wirepack.spring.WirepackProperties;
 import com.cdrware.wirepack.spring.WirepackUdpServer;
 import org.junit.jupiter.api.Test;
@@ -104,5 +107,21 @@ class DualControllerSmokeTest {
             assertEquals(RpcError.NOT_FOUND, rpc.code());
             assertTrue(rpc.getMessage().contains("nope"));
         }
+    }
+
+    @Test
+    void sameMethodViaHttpWirepackBody() throws Exception {
+        byte[] body = KvTreeCodec.encode(ObjectBinder.toTree(new EchoIn("hi")), SafetyLimits.defaults());
+        var result = mockMvc.perform(post("/echo")
+                        .contentType(WirepackHttpMessageConverter.MEDIA_TYPE)
+                        .accept(WirepackHttpMessageConverter.MEDIA_TYPE)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andReturn()
+                .getResponse();
+        EchoOut out = ObjectBinder.fromTree(
+                KvTreeCodec.decode(result.getContentAsByteArray(), SafetyLimits.defaults()), EchoOut.class);
+        assertEquals("hi", out.msg());
+        assertEquals(WirepackHttpMessageConverter.MEDIA_TYPE.toString(), result.getContentType());
     }
 }

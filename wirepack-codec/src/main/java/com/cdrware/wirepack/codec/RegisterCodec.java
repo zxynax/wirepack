@@ -3,6 +3,7 @@ package com.cdrware.wirepack.codec;
 import com.cdrware.wirepack.api.BuiltinTypeId;
 import com.cdrware.wirepack.api.Entity;
 import com.cdrware.wirepack.api.FieldDef;
+import com.cdrware.wirepack.api.RegisterAck;
 import com.cdrware.wirepack.api.RegisteredSchema;
 import com.cdrware.wirepack.api.SafetyLimits;
 import com.cdrware.wirepack.api.WireType;
@@ -114,6 +115,34 @@ public final class RegisterCodec {
 
     public static Entity toEntity(RegisteredSchema schema, SafetyLimits limits) {
         return new Entity(BuiltinTypeId.REGISTER.id(), encodeRegister(schema, limits));
+    }
+
+    /** {@code status} 0 accepts, 1 rejects. The hash is the one offered in REGISTER. */
+    public static byte[] encodeRegisterAck(int typeId, int schemaHash, boolean accepted) {
+        if (typeId < 0 || typeId > 0xFFFF) {
+            throw new WirepackException("typeId out of u16 range");
+        }
+        ByteBuffer buf = ByteBuffer.allocate(7).order(ByteOrder.BIG_ENDIAN);
+        buf.putShort((short) typeId);
+        buf.putInt(schemaHash);
+        buf.put((byte) (accepted ? 0 : 1));
+        return buf.array();
+    }
+
+    public static RegisterAck decodeRegisterAck(byte[] value) {
+        ByteBuffer buf = ByteBuffer.wrap(value).order(ByteOrder.BIG_ENDIAN);
+        require(buf, 7, "REGISTER_ACK");
+        int typeId = Short.toUnsignedInt(buf.getShort());
+        int schemaHash = buf.getInt();
+        int status = Byte.toUnsignedInt(buf.get());
+        if (status > 1) {
+            throw new WirepackException("REGISTER_ACK status out of range: " + status);
+        }
+        return new RegisterAck(typeId, schemaHash, status == 0);
+    }
+
+    public static Entity toAckEntity(int typeId, int schemaHash, boolean accepted) {
+        return new Entity(BuiltinTypeId.REGISTER_ACK.id(), encodeRegisterAck(typeId, schemaHash, accepted));
     }
 
     public static byte[] encodeEntityFrag(byte[] uid, int fragIndex, int fragCount, byte[] data) {

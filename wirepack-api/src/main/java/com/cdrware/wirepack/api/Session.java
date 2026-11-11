@@ -3,6 +3,7 @@ package com.cdrware.wirepack.api;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -35,6 +36,18 @@ public interface Session extends AutoCloseable {
     <T> CompletableFuture<Void> sendObject(T bean);
 
     void onEntity(Consumer<Entity> handler);
+
+    /**
+     * Send {@code REGISTER} and complete when the peer answers with {@code REGISTER_ACK}
+     * for this type id and schema hash. A rejected ack fails the future: the peer kept
+     * its stored schema and quarantined the type.
+     */
+    CompletableFuture<RegisterAck> register(RegisteredSchema schema);
+
+    /**
+     * Schema stored from an accepted {@code REGISTER}, if this session has one for {@code typeId}.
+     */
+    Optional<RegisteredSchema> registeredSchema(int typeId);
 
     /**
      * Invoked for each complete {@code KV_TREE} (whole entity or reassembled frags).

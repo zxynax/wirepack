@@ -1,1 +1,2 @@
 com.cdrware.wirepack.spring.autoconfigure.WirepackAutoConfiguration
+com.cdrware.wirepack.spring.autoconfigure.WirepackHttpMessageConverterConfiguration

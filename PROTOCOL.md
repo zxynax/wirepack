@@ -76,7 +76,7 @@ Entity := type_id:u16  length:u16  value[length]
 |--------:|------|--------|
 | 0 | EOE | empty (`length=0`) |
 | 1 | REGISTER | schema advertisement (central-authoritative) |
-| 2 | REGISTER_ACK | optional unicast ack of type_id |
+| 2 | REGISTER_ACK | unicast ack of a REGISTER (type_id, schema_hash, status) |
 | 3 | ENTITY_FRAG | `{uid, fragIndex, fragCount, bytes}` — large logical object slice |
 | 4 | REKEY_OFFER | v1: in-flight ECDH offer (see Crypto) |
 | 5 | REKEY_ACCEPT | v1: in-flight ECDH accept (see Crypto) |
@@ -127,6 +127,18 @@ Only STRING/BYTES/NESTED are length-prefixed on the wire.
 `NESTED` is a typed blob for registry layouts (pre-encoded child TLVs). It does **not** rebuild free-form maps like `{"a":{"b":{}}}`. Use **`KV_TREE`** for that.
 
 Redefining the same `type_id` with a different `schema_hash` is a hard error (reject/quarantine).
+
+### REGISTER_ACK value
+
+The receiver sends this after a `REGISTER`. The session does not deliver `REGISTER` or `REGISTER_ACK` as application entities.
+
+```text
+type_id: u16
+schema_hash: u32
+status: u8          // 0 accepted, 1 rejected
+```
+
+`status = 0` stores the schema (a repeat of the same hash is accepted again). `status = 1` means that `type_id` is already stored under a different hash: the stored schema stays, and the type is quarantined. Later application entities with that `type_id` are dropped.
 
 ### Application entity body
 
@@ -195,6 +207,10 @@ Reserved keys:
 | `error` | OBJECT or NULL | `{ code: STRING, message: STRING }` — set on failed `res` |
 
 Client: `Session.request(route, pojo, Response.class)` fills `corrId` and completes when a matching `res` arrives (or times out). Server: `Session.onRpc(route, handler)` / `@WirepackMapping`. Standard error codes: `NOT_FOUND`, `HANDLER`, `BIND`.
+
+### HTTP `application/wirepack`
+
+Optional servlet adapter. The body is one `KV_TREE` value: the same object tree the binder uses for an RPC `payload`. It is not a frame and it does not include the RPC envelope (`_wp`, `route`, `corrId`). The HTTP path is the route. UDP RPC stays on the session and wraps that payload in the envelope.
 
 ### ENTITY_FRAG value
 

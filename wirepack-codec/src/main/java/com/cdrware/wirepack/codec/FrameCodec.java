@@ -77,7 +77,12 @@ public final class FrameCodec {
         }
         int keyId = buf.getInt();
         int msgTypeCode = Byte.toUnsignedInt(buf.get());
-        MsgType msgType = MsgType.fromCode(msgTypeCode);
+        MsgType msgType;
+        try {
+            msgType = MsgType.fromCode(msgTypeCode);
+        } catch (IllegalArgumentException ex) {
+            throw new WirepackException("unsupported msgType: " + msgTypeCode, ex);
+        }
         int sessionId = buf.getInt();
         int streamId = Short.toUnsignedInt(buf.getShort());
         int seq = Short.toUnsignedInt(buf.getShort());

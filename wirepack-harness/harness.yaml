@@ -1,0 +1,18 @@
+# Reference shape for running wirepack-harness as a standalone service.
+# Command-line flags replace the same key. Do not put a live key in this file;
+# pass --key or point activateUrl at the organization HTTPS activation endpoint.
+
+mode: activate-then-connect
+activateUrl: https://activate.example/activate
+deviceId: harness-1
+organization: example
+health: 127.0.0.1:8081
+holdMs: 5000
+
+# Listen side, including the local HTTP bootstrap that hands out the data-plane key:
+# mode: listen
+# bind: 0.0.0.0:9700
+# key: 00112233445566778899aabbccddeeff
+# keyId: 1
+# activationServer: 8080
+# health: 127.0.0.1:8081

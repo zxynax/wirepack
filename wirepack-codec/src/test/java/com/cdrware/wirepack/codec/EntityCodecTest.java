@@ -98,6 +98,15 @@ class EntityCodecTest {
         assertEquals(2, entities.size());
         assertEquals(1, entities.get(0).typeId()); // REGISTER
         assertEquals(1024, entities.get(1).typeId());
+
+        Entity ack = RegisterCodec.toAckEntity(sku.typeId(), sku.schemaHash(), true);
+        assertEquals(2, ack.typeId());
+        var decodedAck = RegisterCodec.decodeRegisterAck(ack.valueRaw());
+        assertEquals(sku.typeId(), decodedAck.typeId());
+        assertEquals(sku.schemaHash(), decodedAck.schemaHash());
+        assertTrue(decodedAck.accepted());
+        Entity rejected = RegisterCodec.toAckEntity(sku.typeId(), sku.schemaHash(), false);
+        assertFalse(RegisterCodec.decodeRegisterAck(rejected.valueRaw()).accepted());
     }
 
     @Test

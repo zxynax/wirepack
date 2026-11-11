@@ -90,6 +90,12 @@
         <scope>test</scope>
       </dependency>
       <dependency>
+        <groupId>com.code-intelligence</groupId>
+        <artifactId>jazzer-junit</artifactId>
+        <version>0.30.0</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
         <groupId>org.slf4j</groupId>
         <artifactId>slf4j-api</artifactId>
         <version>${slf4j.version}</version>

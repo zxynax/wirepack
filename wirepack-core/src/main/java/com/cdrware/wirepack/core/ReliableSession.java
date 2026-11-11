@@ -5,6 +5,8 @@ import com.cdrware.wirepack.api.Entity;
 import com.cdrware.wirepack.api.FrameHeader;
 import com.cdrware.wirepack.api.MsgType;
 import com.cdrware.wirepack.api.PeerAddress;
+import com.cdrware.wirepack.api.RegisterAck;
+import com.cdrware.wirepack.api.RegisteredSchema;
 import com.cdrware.wirepack.api.RpcEnvelope;
 import com.cdrware.wirepack.api.RpcError;
 import com.cdrware.wirepack.api.RpcException;
@@ -19,7 +21,9 @@ import com.cdrware.wirepack.codec.EntityWriter;
 import com.cdrware.wirepack.codec.FrameCodec;
 import com.cdrware.wirepack.codec.KvTreeCodec;
 import com.cdrware.wirepack.codec.ObjectBinder;
+import com.cdrware.wirepack.codec.RegisterCodec;
 import com.cdrware.wirepack.codec.RpcEnvelopeCodec;
+import com.cdrware.wirepack.codec.TypeRegistry;
 import com.cdrware.wirepack.crypto.AeadPayload;
 import com.cdrware.wirepack.crypto.AeadSuite;
 import com.cdrware.wirepack.crypto.SessionCrypto;
@@ -31,6 +35,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -79,6 +85,9 @@ public final class ReliableSession implements Session {
     private final ConcurrentHashMap<Long, PendingRpc<?>> rpcPending = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RpcHandler> rpcRoutes = new ConcurrentHashMap<>();
     private final AtomicLong rpcCorr = new AtomicLong();
+    private final TypeRegistry registry;
+    private final Set<Integer> quarantined = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Integer, PendingRegister> pendingRegisters = new ConcurrentHashMap<>();
 
     private volatile BiConsumer<PeerAddress, byte[]> sender;
     private volatile long lastAckProgressMs = System.currentTimeMillis();
@@ -92,6 +101,7 @@ public final class ReliableSession implements Session {
         this.sessionId = sessionId;
         this.peer = Objects.requireNonNull(peer, "peer");
         this.config = Objects.requireNonNull(config, "config");
+        this.registry = new TypeRegistry(this.config.limits());
         this.streamId = streamId;
         this.frameCodec = new FrameCodec(config.limits());
         this.state = new SessionState(config.windowSize());
@@ -388,7 +398,11 @@ public final class ReliableSession implements Session {
                     } catch (Exception ex) {
                         log.warn("rekey accept handling failed", ex);
                     }
-                } else if (e.typeId() != BuiltinTypeId.EOE.id()) {
+                } else if (e.typeId() == BuiltinTypeId.REGISTER.id()) {
+                    handleRegister(e);
+                } else if (e.typeId() == BuiltinTypeId.REGISTER_ACK.id()) {
+                    handleRegisterAck(e);
+                } else if (e.typeId() != BuiltinTypeId.EOE.id() && !quarantined.contains(e.typeId())) {
                     app.add(e);
                 }
             }
@@ -574,9 +588,80 @@ public final class ReliableSession implements Session {
     /** 32-byte pub + 12 nonce + 16 tag. */
     private static final int X25519_PUB_SEALED_LEN = 32 + AEAD_OVERHEAD;
 
+    private void handleRegister(Entity entity) {
+        RegisteredSchema incoming;
+        try {
+            incoming = RegisterCodec.decodeRegister(entity.valueRaw(), config.limits());
+        } catch (Exception ex) {
+            log.warn("REGISTER decode failed", ex);
+            return;
+        }
+        boolean accepted = false;
+        if (!quarantined.contains(incoming.typeId())) {
+            try {
+                registry.register(incoming);
+                accepted = true;
+            } catch (WirepackException ex) {
+                quarantined.add(incoming.typeId());
+                log.warn("REGISTER rejected: {}", ex.getMessage());
+            }
+        }
+        send(List.of(RegisterCodec.toAckEntity(incoming.typeId(), incoming.schemaHash(), accepted)));
+    }
+
+    private void handleRegisterAck(Entity entity) {
+        RegisterAck ack;
+        try {
+            ack = RegisterCodec.decodeRegisterAck(entity.valueRaw());
+        } catch (Exception ex) {
+            log.warn("REGISTER_ACK decode failed", ex);
+            return;
+        }
+        PendingRegister pending = pendingRegisters.get(ack.typeId());
+        if (pending == null || pending.schemaHash != ack.schemaHash()) {
+            return;
+        }
+        pendingRegisters.remove(ack.typeId(), pending);
+        if (ack.accepted()) {
+            pending.future.complete(ack);
+        } else {
+            pending.future.completeExceptionally(new WirepackException(
+                    "REGISTER rejected for type_id=" + ack.typeId()));
+        }
+    }
+
     @Override
     public void onEntity(Consumer<Entity> handler) {
         entityHandlers.add(Objects.requireNonNull(handler));
+    }
+
+    @Override
+    public CompletableFuture<RegisterAck> register(RegisteredSchema schema) {
+        Objects.requireNonNull(schema, "schema");
+        if (!open.get()) {
+            return CompletableFuture.failedFuture(new WirepackException("session closed"));
+        }
+        CompletableFuture<RegisterAck> future = new CompletableFuture<>();
+        PendingRegister pending = new PendingRegister(schema.schemaHash(), future);
+        PendingRegister prev = pendingRegisters.put(schema.typeId(), pending);
+        if (prev != null) {
+            prev.future.completeExceptionally(new WirepackException(
+                    "REGISTER superseded for type_id=" + schema.typeId()));
+        }
+        Entity entity = RegisterCodec.toEntity(schema, config.limits());
+        send(List.of(entity)).whenComplete((v, ex) -> {
+            if (ex != null) {
+                pendingRegisters.remove(schema.typeId(), pending);
+                future.completeExceptionally(ex);
+            }
+        });
+        return future.orTimeout(30, TimeUnit.SECONDS).whenComplete((r, ex) ->
+                pendingRegisters.remove(schema.typeId(), pending));
+    }
+
+    @Override
+    public Optional<RegisteredSchema> registeredSchema(int typeId) {
+        return registry.get(typeId);
     }
 
     @Override
@@ -638,6 +723,16 @@ public final class ReliableSession implements Session {
         closeHandlers.add(Objects.requireNonNull(handler));
     }
 
+    private static final class PendingRegister {
+        private final int schemaHash;
+        private final CompletableFuture<RegisterAck> future;
+
+        PendingRegister(int schemaHash, CompletableFuture<RegisterAck> future) {
+            this.schemaHash = schemaHash;
+            this.future = future;
+        }
+    }
+
     private static final class PendingRpc<T> {
         private final CompletableFuture<T> future;
         private final Class<T> responseType;
@@ -696,6 +791,10 @@ public final class ReliableSession implements Session {
             p.future.completeExceptionally(new WirepackException("session closed"));
         }
         rpcPending.clear();
+        for (PendingRegister p : pendingRegisters.values()) {
+            p.future.completeExceptionally(new WirepackException("session closed"));
+        }
+        pendingRegisters.clear();
         try {
             sendControl(MsgType.BYE, new byte[0]);
         } catch (Exception e) {
